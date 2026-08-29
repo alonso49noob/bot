@@ -3,6 +3,26 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from google import genai
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# --- up time robot ---
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot esta vivo")
+
+    def log_message(self, format, *args):
+        return # Silencia visitas web en la consola
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
+    print(f"Servidor de keep-alive corriendo en el puerto {port}")
+    server.serve_forever()
+# ----------------------
 
 # var
 load_dotenv()
@@ -21,9 +41,9 @@ bot = commands.Bot(command_prefix="-", intents=intents)
 async def on_ready():
     print(f"bot inicializado {bot.user.name}")
 
-@bot.command(name="ai")
-async def ask_ai(ctx, *, prompt: str):
-    """Responde al comando -ai con Gemini 2.5 Flash"""
+@bot.command(name="a")
+async def ask_nigga(ctx, *, prompt: str):
+    """Responde al comando -a con Gemini 2.5 Flash"""
     # procesando flnsmdfr
     async with ctx.typing():
         try:
@@ -41,5 +61,9 @@ async def ask_ai(ctx, *, prompt: str):
                 
         except Exception as e:
             await ctx.send(f"me jodi, llama a alonso, error: {e}")
+
+# --- Iniciar el servidor web en paralelo antes de encender el bot ---
+web_thread = threading.Thread(target=run_web_server, daemon=True)
+web_thread.start()
 
 bot.run(DISCORD_TOKEN)
