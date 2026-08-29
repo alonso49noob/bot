@@ -24,7 +24,7 @@ async def on_ready():
 @bot.command(name="ai")
 async def ask_ai(ctx, *, prompt: str):
     """Responde al comando -ai con Gemini 2.5 Flash"""
-    # Visual indicator that the bot is processing
+    # procesando flnsmdfr
     async with ctx.typing():
         try:
             # gemini 2.5 flash
