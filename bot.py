@@ -50,11 +50,15 @@ Reglas:
 """
 
 
+DOCS: list[tuple[str, str]] = []
+
+
 def load_knowledge() -> str:
     """Lee README, LEEME_PLAYTEST y los .md de docs/ del repo del mod."""
     files = [KNOWLEDGE_DIR / "README.md", KNOWLEDGE_DIR / "LEEME_PLAYTEST.md"]
     files += sorted((KNOWLEDGE_DIR / "docs").rglob("*.md"))
     parts, total = [], 0
+    DOCS.clear()
     for f in files:
         if not f.is_file():
             continue
@@ -64,6 +68,7 @@ def load_knowledge() -> str:
             break
         text = text[:room]
         parts.append(f"=== {f.relative_to(KNOWLEDGE_DIR)} ===\n{text}")
+        DOCS.append((str(f.relative_to(KNOWLEDGE_DIR)), text))
         total += len(text)
     version_file = KNOWLEDGE_DIR / "VERSION"
     version = version_file.read_text().strip() if version_file.is_file() else "desconocida"
@@ -73,6 +78,28 @@ def load_knowledge() -> str:
 
 KNOWLEDGE = load_knowledge()
 SYSTEM_PROMPT = PERSONALITY + "\nDOCUMENTACIÓN DEL MOD:\n" + KNOWLEDGE
+# Los proveedores gratis suelen limitar los tokens por petición/minuto (Groq: error 413 con el prompt completo).
+# Para ellos se envía solo la parte de la documentación más relacionada con la pregunta.
+OPENAI_CONTEXT_CHARS = int(os.environ.get("OPENAI_CONTEXT_CHARS", "14000"))
+
+
+def light_system_prompt(question: str) -> str:
+    words = {w for w in question.lower().split() if len(w) > 3}
+    scored = sorted(
+        (sum(text.lower().count(w) for w in words), name, text) for name, text in DOCS if name != "README.md"
+    )[::-1]
+    budget = OPENAI_CONTEXT_CHARS
+    parts = []
+    readme = next((t for n, t in DOCS if n == "README.md"), "")
+    parts.append("=== README.md ===\n" + readme[: budget // 2])
+    budget -= len(parts[0])
+    for score, name, text in scored:
+        if budget <= 500 or score == 0:
+            break
+        chunk = text[:budget]
+        parts.append(f"=== {name} ===\n{chunk}")
+        budget -= len(chunk)
+    return PERSONALITY + "\nDOCUMENTACIÓN DEL MOD (extracto):\n" + "\n\n".join(parts)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -115,7 +142,7 @@ async def ask_openai(messages: list[dict]) -> str:
     payload = {
         "model": OPENAI_MODEL,
         "max_tokens": 1024,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+        "messages": [{"role": "system", "content": light_system_prompt(messages[-1]["content"])}, *messages],
     }
     async with httpx.AsyncClient(timeout=60) as http:
         r = await http.post(f"{OPENAI_BASE_URL}/chat/completions", json=payload, headers=headers)
