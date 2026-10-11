@@ -20,8 +20,13 @@ Responde preguntas sobre el mod FarBeyond y conversa con la comunidad de El Hang
 El bot lee al arrancar los `.md` de `conocimiento/` (copia del README, `LEEME_PLAYTEST.md` y `docs/` de `ehdj-rp`).
 Cuando el mod cambie, copia de nuevo esos archivos y reinicia el bot.
 
-## Más modelos gratis (respaldo)
-Además de Gemini, el bot acepta cualquier API con formato OpenAI (`/chat/completions`): un proxy como
-[FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi), Groq, OpenRouter, etc. Define `OPENAI_BASE_URL`, `OPENAI_API_KEY`
-y `OPENAI_MODEL` en el `.env`. Si Gemini falla o se queda sin cuota, el bot prueba el siguiente proveedor.
-`LLM_PROVIDERS=openai,gemini` cambia el orden.
+## Varios proveedores (respaldos)
+El bot prueba los proveedores en el orden de `LLM_PROVIDERS` y usa la primera respuesta válida. Gemini va con `GEMINI_API_KEY`.
+Cualquier servicio con formato OpenAI (`/chat/completions`: Groq, OpenRouter, un proxy como
+[FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi)...) se añade con tres variables `NOMBRE_BASE_URL`, `NOMBRE_API_KEY`
+y `NOMBRE_MODEL`, y poniendo `nombre` en `LLM_PROVIDERS`. Mira `.env.example`.
+
+- Un proveedor que falla se salta durante 1 minuto (5 si fue por límite de uso, 429), para no retrasar cada mensaje.
+- A los que no son Gemini se les manda solo un extracto de la documentación (`OPENAI_CONTEXT_CHARS`), porque las capas gratis limitan los tokens.
+- Un `OPENAI_BASE_URL` antiguo sigue funcionando: es el proveedor `openai`.
+- La terminal muestra qué proveedor y modelo respondió cada mensaje, y el error exacto cuando uno falla.
