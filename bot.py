@@ -1,5 +1,5 @@
 """Bot de Discord de FarBeyond: responde preguntas sobre el mod y conversa con la comunidad.
-Usa la API de Gemini."""
+Usa Gemini y, opcionalmente, cualquier API compatible con OpenAI como respaldo."""
 import logging
 import os
 import time
@@ -13,7 +13,15 @@ load_dotenv()
 log = logging.getLogger("farbeyond-bot")
 logging.basicConfig(level=logging.INFO)
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+# Proveedor opcional compatible con OpenAI (FreeLLMAPI, Groq, OpenRouter...). Se usa si Gemini falla.
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "auto")
+# Orden de proveedores, separados por coma. Por defecto: Gemini y, si hay OPENAI_BASE_URL, el otro.
+PROVIDERS = [p.strip() for p in os.environ.get("LLM_PROVIDERS", "").split(",") if p.strip()] or (
+    (["gemini"] if os.environ.get("GEMINI_API_KEY") else []) + (["openai"] if OPENAI_BASE_URL else [])
+)
 KNOWLEDGE_DIR = Path(os.environ.get("KNOWLEDGE_DIR", str(Path(__file__).parent / "conocimiento"))).resolve()
 CHAT_CHANNEL_IDS = {
     int(x) for x in os.environ.get("CHAT_CHANNEL_IDS", "").split(",") if x.strip()
@@ -88,22 +96,55 @@ def split_message(text: str) -> list[str]:
 
 
 async def ask_gemini(messages: list[dict]) -> str:
-    from google.genai import errors, types
+    from google.genai import types
 
     contents = [
         types.Content(role="user" if m["role"] == "user" else "model", parts=[types.Part(text=m["content"])])
         for m in messages
     ]
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        max_output_tokens=1024,
-    )
-    try:
-        resp = await _gemini().aio.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
-    except errors.APIError as e:
-        log.exception("Error de la API de Gemini: %s", e)
-        return RATE_LIMIT_MSG if e.code == 429 else ERROR_MSG
-    return (resp.text or "").strip() or "..."
+    config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, max_output_tokens=1024)
+    resp = await _gemini().aio.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+    return (resp.text or "").strip()
+
+
+async def ask_openai(messages: list[dict]) -> str:
+    """Cualquier API con el formato de OpenAI (/chat/completions)."""
+    import httpx
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"} if OPENAI_API_KEY else {}
+    payload = {
+        "model": OPENAI_MODEL,
+        "max_tokens": 1024,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+    }
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post(f"{OPENAI_BASE_URL}/chat/completions", json=payload, headers=headers)
+        r.raise_for_status()
+    return (r.json()["choices"][0]["message"]["content"] or "").strip()
+
+
+BACKENDS = {"gemini": ask_gemini, "openai": ask_openai}
+
+
+async def ask_llm(messages: list[dict]) -> str:
+    """Prueba los proveedores en orden y devuelve la primera respuesta válida."""
+    rate_limited = False
+    for name in PROVIDERS:
+        backend = BACKENDS.get(name)
+        if backend is None:
+            log.warning("Proveedor desconocido en LLM_PROVIDERS: %s", name)
+            continue
+        try:
+            text = await backend(messages)
+        except Exception as e:  # cualquier fallo -> probar el siguiente
+            log.warning("Falló el proveedor %s: %s", name, e)
+            rate_limited = rate_limited or "429" in str(e)
+            continue
+        if text:
+            model = GEMINI_MODEL if name == "gemini" else OPENAI_MODEL
+            log.info("Respondió %s (modelo %s)", name, model)
+            return text
+    return RATE_LIMIT_MSG if rate_limited else ERROR_MSG
 
 
 _client = None
@@ -154,6 +195,8 @@ def should_answer(message: discord.Message) -> bool:
 
 @bot.event
 async def on_ready():
+    log.info("Proveedores en orden: %s | gemini=%s | openai=%s @ %s",
+             PROVIDERS, GEMINI_MODEL, OPENAI_MODEL, OPENAI_BASE_URL or "-")
     log.info("Conectado como %s", bot.user)
 
 
@@ -172,7 +215,7 @@ async def on_message(message: discord.Message):
         turns = build_turns(history)
         if not turns or turns[-1]["role"] != "user":
             return
-        answer = await ask_gemini(turns)
+        answer = await ask_llm(turns)
     first = True
     for chunk in split_message(answer):
         if first:
