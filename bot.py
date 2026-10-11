@@ -13,7 +13,7 @@ load_dotenv()
 log = logging.getLogger("farbeyond-bot")
 logging.basicConfig(level=logging.INFO)
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 KNOWLEDGE_DIR = Path(os.environ.get("KNOWLEDGE_DIR", str(Path(__file__).parent / "conocimiento"))).resolve()
 CHAT_CHANNEL_IDS = {
     int(x) for x in os.environ.get("CHAT_CHANNEL_IDS", "").split(",") if x.strip()
