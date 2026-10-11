@@ -141,6 +141,8 @@ async def ask_llm(messages: list[dict]) -> str:
             rate_limited = rate_limited or "429" in str(e)
             continue
         if text:
+            model = GEMINI_MODEL if name == "gemini" else OPENAI_MODEL
+            log.info("Respondió %s (modelo %s)", name, model)
             return text
     return RATE_LIMIT_MSG if rate_limited else ERROR_MSG
 
@@ -193,6 +195,8 @@ def should_answer(message: discord.Message) -> bool:
 
 @bot.event
 async def on_ready():
+    log.info("Proveedores en orden: %s | gemini=%s | openai=%s @ %s",
+             PROVIDERS, GEMINI_MODEL, OPENAI_MODEL, OPENAI_BASE_URL or "-")
     log.info("Conectado como %s", bot.user)
 
 
