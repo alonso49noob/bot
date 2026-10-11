@@ -14,14 +14,19 @@ log = logging.getLogger("farbeyond-bot")
 logging.basicConfig(level=logging.INFO)
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-# Proveedor opcional compatible con OpenAI (FreeLLMAPI, Groq, OpenRouter...). Se usa si Gemini falla.
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "auto")
-# Orden de proveedores, separados por coma. Por defecto: Gemini y, si hay OPENAI_BASE_URL, el otro.
-PROVIDERS = [p.strip() for p in os.environ.get("LLM_PROVIDERS", "").split(",") if p.strip()] or (
-    (["gemini"] if os.environ.get("GEMINI_API_KEY") else []) + (["openai"] if OPENAI_BASE_URL else [])
+
+
+def _openai_compatible_names() -> list[str]:
+    """Proveedores con formato OpenAI configurados por entorno: cada NOMBRE_BASE_URL define uno (nombre en minúsculas)."""
+    return [k[: -len("_BASE_URL")].lower() for k, v in os.environ.items() if k.endswith("_BASE_URL") and v.strip()]
+
+
+# Orden de proveedores, separados por coma (p. ej. groq,openrouter,gemini). Por defecto: Gemini y los que tengan NOMBRE_BASE_URL.
+PROVIDERS = [p.strip().lower() for p in os.environ.get("LLM_PROVIDERS", "").split(",") if p.strip()] or (
+    (["gemini"] if os.environ.get("GEMINI_API_KEY") else []) + _openai_compatible_names()
 )
+PROVIDER_COOLDOWN_S = 60     # tras fallar, se salta ese proveedor durante este tiempo
+RATE_LIMIT_COOLDOWN_S = 300  # igual, pero si fue por límite de uso (429)
 KNOWLEDGE_DIR = Path(os.environ.get("KNOWLEDGE_DIR", str(Path(__file__).parent / "conocimiento"))).resolve()
 CHAT_CHANNEL_IDS = {
     int(x) for x in os.environ.get("CHAT_CHANNEL_IDS", "").split(",") if x.strip()
@@ -80,7 +85,7 @@ KNOWLEDGE = load_knowledge()
 SYSTEM_PROMPT = PERSONALITY + "\nDOCUMENTACIÓN DEL MOD:\n" + KNOWLEDGE
 # Los proveedores gratis suelen limitar los tokens por petición/minuto (Groq: error 413 con el prompt completo).
 # Para ellos se envía solo la parte de la documentación más relacionada con la pregunta.
-OPENAI_CONTEXT_CHARS = int(os.environ.get("OPENAI_CONTEXT_CHARS", "14000"))
+LIGHT_CONTEXT_CHARS = int(os.environ.get("OPENAI_CONTEXT_CHARS", "14000"))
 
 
 def light_system_prompt(question: str) -> str:
@@ -88,7 +93,7 @@ def light_system_prompt(question: str) -> str:
     scored = sorted(
         (sum(text.lower().count(w) for w in words), name, text) for name, text in DOCS if name != "README.md"
     )[::-1]
-    budget = OPENAI_CONTEXT_CHARS
+    budget = LIGHT_CONTEXT_CHARS
     parts = []
     readme = next((t for n, t in DOCS if n == "README.md"), "")
     parts.append("=== README.md ===\n" + readme[: budget // 2])
@@ -134,42 +139,58 @@ async def ask_gemini(messages: list[dict]) -> str:
     return (resp.text or "").strip()
 
 
-async def ask_openai(messages: list[dict]) -> str:
-    """Cualquier API con el formato de OpenAI (/chat/completions)."""
+def _openai_config(name: str) -> tuple[str, str, str]:
+    prefix = name.upper()
+    base = os.environ.get(f"{prefix}_BASE_URL", "").rstrip("/")
+    if not base:
+        raise RuntimeError(f"falta {prefix}_BASE_URL en el .env")
+    return base, os.environ.get(f"{prefix}_API_KEY", ""), os.environ.get(f"{prefix}_MODEL", "auto")
+
+
+async def ask_openai_compatible(name: str, messages: list[dict]) -> str:
+    """Cualquier API con el formato de OpenAI (/chat/completions): Groq, OpenRouter, FreeLLMAPI..."""
     import httpx
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"} if OPENAI_API_KEY else {}
+    base, key, model = _openai_config(name)
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
     payload = {
-        "model": OPENAI_MODEL,
+        "model": model,
         "max_tokens": 1024,
         "messages": [{"role": "system", "content": light_system_prompt(messages[-1]["content"])}, *messages],
     }
     async with httpx.AsyncClient(timeout=60) as http:
-        r = await http.post(f"{OPENAI_BASE_URL}/chat/completions", json=payload, headers=headers)
-        r.raise_for_status()
+        r = await http.post(f"{base}/chat/completions", json=payload, headers=headers)
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.status_code} {r.text[:300]}")
     return (r.json()["choices"][0]["message"]["content"] or "").strip()
 
 
-BACKENDS = {"gemini": ask_gemini, "openai": ask_openai}
+def model_of(name: str) -> str:
+    return GEMINI_MODEL if name == "gemini" else os.environ.get(f"{name.upper()}_MODEL", "auto")
+
+
+failed_until: dict[str, float] = {}
 
 
 async def ask_llm(messages: list[dict]) -> str:
     """Prueba los proveedores en orden y devuelve la primera respuesta válida."""
+    now = time.monotonic()
+    candidates = [n for n in PROVIDERS if failed_until.get(n, 0) <= now] or PROVIDERS
     rate_limited = False
-    for name in PROVIDERS:
-        backend = BACKENDS.get(name)
-        if backend is None:
-            log.warning("Proveedor desconocido en LLM_PROVIDERS: %s", name)
-            continue
+    for name in candidates:
         try:
-            text = await backend(messages)
+            if name == "gemini":
+                text = await ask_gemini(messages)
+            else:
+                text = await ask_openai_compatible(name, messages)
         except Exception as e:  # cualquier fallo -> probar el siguiente
+            limited = "429" in str(e)
+            rate_limited = rate_limited or limited
+            failed_until[name] = time.monotonic() + (RATE_LIMIT_COOLDOWN_S if limited else PROVIDER_COOLDOWN_S)
             log.warning("Falló el proveedor %s: %s", name, e)
-            rate_limited = rate_limited or "429" in str(e)
             continue
         if text:
-            model = GEMINI_MODEL if name == "gemini" else OPENAI_MODEL
-            log.info("Respondió %s (modelo %s)", name, model)
+            log.info("Respondió %s (modelo %s)", name, model_of(name))
             return text
     return RATE_LIMIT_MSG if rate_limited else ERROR_MSG
 
@@ -222,8 +243,7 @@ def should_answer(message: discord.Message) -> bool:
 
 @bot.event
 async def on_ready():
-    log.info("Proveedores en orden: %s | gemini=%s | openai=%s @ %s",
-             PROVIDERS, GEMINI_MODEL, OPENAI_MODEL, OPENAI_BASE_URL or "-")
+    log.info("Proveedores en orden: %s", ", ".join(f"{n} ({model_of(n)})" for n in PROVIDERS) or "NINGUNO")
     log.info("Conectado como %s", bot.user)
 
 
